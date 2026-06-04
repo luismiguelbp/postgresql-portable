@@ -1,1 +1,1 @@
-"""Portable PostgreSQL helper."""
+"""PostgreSQL Portable helper."""

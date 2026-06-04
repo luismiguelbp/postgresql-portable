@@ -1,4 +1,4 @@
-# Portable PostgreSQL (ZIP version)
+# PostgreSQL Portable (ZIP version)
 
 Run PostgreSQL on Windows without an installer or admin privileges.
 

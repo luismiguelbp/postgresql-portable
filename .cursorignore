@@ -1,0 +1,12 @@
+# Cursor exclusions; terminal and MCP access may still be possible
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.key
+*.token
+data/
+data_winccoa_tablespaces/
+.venv/
+venv/

@@ -1,4 +1,10 @@
 .env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.key
+*.token
 .venv/
 venv/
 __pycache__/

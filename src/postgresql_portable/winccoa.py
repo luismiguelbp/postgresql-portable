@@ -5,11 +5,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from postgresql_portable.config import PgConfig, ROOT, ensure_binary
+from postgresql_portable.config import PgConfig, ROOT, ensure_binary, require_cli_token
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _DEFAULT_TABLESPACE_ROOT = ROOT / "data_winccoa_tablespaces"
@@ -65,8 +66,11 @@ def load_winccoa_config(*, require_password: bool = True) -> WinCCOAConfig:
     _validate_schema_fingerprint(version, schema_dir)
 
     pg_schema = os.environ.get("WINCCOA_PG_SCHEMA", _DEFAULT_PG_SCHEMA).strip() or _DEFAULT_PG_SCHEMA
-    db_host = os.environ.get("WINCCOA_DB_HOST", "localhost").strip() or "localhost"
-    db_port = os.environ.get("WINCCOA_DB_PORT", "5432").strip() or "5432"
+    db_host = require_cli_token(
+        os.environ.get("WINCCOA_DB_HOST", "localhost").strip() or "localhost",
+        "WINCCOA_DB_HOST",
+    )
+    db_port = _validate_port(os.environ.get("WINCCOA_DB_PORT", "5432").strip() or "5432")
     force_recreate = os.environ.get("WINCCOA_FORCE_RECREATE", "").strip().lower() in (
         "1",
         "true",
@@ -219,6 +223,26 @@ def _validate_identifier(value: str, label: str) -> str:
     return value
 
 
+def _validate_port(value: str) -> str:
+    if not value.isdigit() or not 1 <= int(value) <= 65535:
+        sys.exit(f"WINCCOA_DB_PORT must be a TCP port: {value!r}")
+    return value
+
+
+def _psql_set_line(name: str, value: str) -> str:
+    if not _IDENTIFIER_RE.match(name):
+        sys.exit(f"Invalid psql variable: {name!r}")
+    if any(ch in value for ch in ("\n", "\r", "\x00")):
+        sys.exit(f"psql variable {name} contains a newline or NUL")
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"\\set {name} '{escaped}'"
+
+
+def _psql_ir_line(path: Path) -> str:
+    posix = path.resolve().as_posix().replace("'", "\\'")
+    return f"\\ir '{posix}'"
+
+
 def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
@@ -299,13 +323,18 @@ def _psql_scalar(
     return result.stdout.strip()
 
 
-def _tablespace_paths() -> dict[str, Path]:
+def _tablespace_root() -> Path:
     root_raw = os.environ.get("WINCCOA_TABLESPACE_ROOT", "").strip()
     base = Path(root_raw) if root_raw else _DEFAULT_TABLESPACE_ROOT
     if not base.is_absolute():
         base = (ROOT / base).resolve()
     else:
         base = base.resolve()
+    return base
+
+
+def _tablespace_paths() -> dict[str, Path]:
+    base = _tablespace_root()
 
     keys = ("db", "events", "alerts", "backups")
     env_names = {
@@ -366,11 +395,47 @@ def _terminate_db_connections(cfg: PgConfig, wc: WinCCOAConfig) -> None:
     )
 
 
-def _psql_var_args(psql_vars: list[tuple[str, str]]) -> list[str]:
-    args: list[str] = []
-    for key, value in psql_vars:
-        args.extend(["-v", f"{key}={value}"])
-    return args
+def _psql_var_script(psql_vars: list[tuple[str, str]], schema_file: Path) -> str:
+    lines = [_psql_set_line(key, value) for key, value in psql_vars]
+    lines.append(_psql_ir_line(schema_file))
+    return "\n".join(lines) + "\n"
+
+
+def _run_psql_var_script(
+    cfg: PgConfig,
+    wc: WinCCOAConfig,
+    *,
+    schema_file: Path,
+    psql_vars: list[tuple[str, str]],
+    cwd: Path,
+) -> None:
+    body = _psql_var_script(psql_vars, schema_file)
+    fd, name = tempfile.mkstemp(prefix="postgresql-portable-", suffix=".sql")
+    script = Path(name)
+    try:
+        os.write(fd, body.encode("utf-8"))
+        os.close(fd)
+        fd = -1
+        os.chmod(script, 0o600)
+        result = subprocess.run(
+            [
+                str(cfg.psql),
+                "-U",
+                cfg.user,
+                *_connection_args(wc),
+                "-f",
+                str(script),
+            ],
+            cwd=cwd,
+            env=_psql_env(),
+            check=False,
+        )
+        if result.returncode != 0:
+            sys.exit(result.returncode)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        script.unlink(missing_ok=True)
 
 
 def _build_psql_vars_319(
@@ -378,7 +443,6 @@ def _build_psql_vars_319(
     wc: WinCCOAConfig,
     tablespaces: dict[str, Path],
 ) -> list[tuple[str, str]]:
-    password_var = wc.password.replace('"', '\\"')
     return [
         ("numberType", "DOUBLE PRECISION"),
         ("useBtreeIndexesForSegments", "FALSE"),
@@ -393,20 +457,19 @@ def _build_psql_vars_319(
         ("dbEventsTableSpaceName", wc.tablespace_names.events),
         ("dbAlertsTableSpaceName", wc.tablespace_names.alerts),
         ("winccoaUsername", wc.username),
-        ("winccoaPassword", password_var),
+        ("winccoaPassword", wc.password),
         ("dbSchema", wc.pg_schema),
     ]
 
 
 def _build_psql_vars_modern(wc: WinCCOAConfig) -> list[tuple[str, str]]:
-    password_var = wc.password.replace('"', '\\"')
     return [
         ("numberType", "DOUBLE PRECISION"),
         ("UseBtreeIndexForSimpleValueTypes", "FALSE"),
         ("useAdditionalBtreeIndexWithBrinForSegments", "TRUE"),
         ("dbName", wc.database),
         ("winccoaUsername", wc.username),
-        ("winccoaPassword", password_var),
+        ("winccoaPassword", wc.password),
         ("dbSchema", wc.pg_schema),
     ]
 
@@ -457,24 +520,9 @@ def _apply_nga_schema(cfg: PgConfig, wc: WinCCOAConfig) -> None:
     ):
         _drop_database(cfg, wc)
 
-    args: list[str] = ["-f", str(schema_file), *_psql_var_args(psql_vars)]
-
     print()
     print(drop_message)
-    result = subprocess.run(
-        [
-            str(cfg.psql),
-            "-U",
-            cfg.user,
-            *_connection_args(wc),
-            *args,
-        ],
-        cwd=schema_dir,
-        env=_psql_env(),
-        check=False,
-    )
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+    _run_psql_var_script(cfg, wc, schema_file=schema_file, psql_vars=psql_vars, cwd=schema_dir)
 
     version = _psql_scalar(
         cfg,
@@ -570,8 +618,31 @@ def _drop_role(cfg: PgConfig, wc: WinCCOAConfig) -> None:
     )
 
 
+def _require_under_tablespace_root(path: Path, root: Path) -> None:
+    root_resolved = root.resolve()
+    if root_resolved == Path(root_resolved.anchor):
+        sys.exit(
+            "Refusing to remove tablespace directories: "
+            f"WINCCOA_TABLESPACE_ROOT is a drive root ({root_resolved})"
+        )
+    resolved = path.resolve()
+    if resolved == root_resolved:
+        sys.exit(f"Refusing to remove tablespace root itself: {root_resolved}")
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        sys.exit(
+            f"Refusing to remove {resolved}: "
+            f"it is outside WINCCOA_TABLESPACE_ROOT ({root_resolved})"
+        )
+
+
 def _remove_tablespace_dirs() -> None:
-    paths = _tablespace_paths()
+    root = _tablespace_root()
+    paths = {name: path.resolve() for name, path in _tablespace_paths().items()}
+    for path in paths.values():
+        _require_under_tablespace_root(path, root)
+
     for name, path in paths.items():
         if not path.exists():
             continue

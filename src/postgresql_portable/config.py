@@ -39,6 +39,14 @@ class PgConfig:
         return (self.data_dir / "PG_VERSION").is_file()
 
 
+def require_cli_token(value: str, label: str) -> str:
+    if not value or value.startswith("-") or any(ch.isspace() or ord(ch) < 32 for ch in value):
+        sys.exit(
+            f"{label} must not be empty, start with '-', or contain whitespace: {value!r}"
+        )
+    return value
+
+
 def load_config() -> PgConfig:
     env_file = os.environ.get("PG_ENV_FILE")
     if env_file:
@@ -69,8 +77,14 @@ def load_config() -> PgConfig:
         data_path = (ROOT / data_path).resolve()
     else:
         data_path = data_path.resolve()
-    user = os.environ.get("PG_USER", "postgres").strip() or "postgres"
-    database = os.environ.get("PG_DATABASE", "postgres").strip() or "postgres"
+    user = require_cli_token(
+        os.environ.get("PG_USER", "postgres").strip() or "postgres",
+        "PG_USER",
+    )
+    database = require_cli_token(
+        os.environ.get("PG_DATABASE", "postgres").strip() or "postgres",
+        "PG_DATABASE",
+    )
 
     return PgConfig(
         install=install_path,

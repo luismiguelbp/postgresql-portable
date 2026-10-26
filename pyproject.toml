@@ -9,7 +9,7 @@ description = "Manage portable PostgreSQL (ZIP binaries on Windows)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "python-dotenv>=1.0,<2",
+    "python-dotenv>=1.2.2,<2",
     "pytest>=8.0,<9",
 ]
 

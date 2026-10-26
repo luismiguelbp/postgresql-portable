@@ -73,6 +73,18 @@ def test_load_config_resolves_relative_install_and_bin(pg_layout, isolated_env, 
     assert cfg.bin_dir == ROOT / "pgsql" / "custom-bin"
 
 
+def test_load_config_rejects_flag_like_user(pg_layout, isolated_env, monkeypatch):
+    env_file = pg_layout["env_file"]
+    env_file.write_text(
+        f"PG_INSTALL={pg_layout['install']}\nPG_USER=-c\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PG_ENV_FILE", str(env_file))
+
+    with pytest.raises(SystemExit, match="PG_USER"):
+        load_config()
+
+
 def test_load_config_missing_pg_install(pg_layout, isolated_env, monkeypatch):
     env_file = pg_layout["env_file"]
     env_file.write_text(f"PG_DATA={pg_layout['data_dir']}\n", encoding="utf-8")

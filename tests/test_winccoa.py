@@ -6,6 +6,8 @@ import pytest
 from postgresql_portable.winccoa import (
     TablespaceNames,
     WinCCOAConfig,
+    _psql_set_line,
+    _remove_tablespace_dirs,
     _schema_sql_without_config_include,
     _validate_schema_fingerprint,
     _validate_version_matches_path,
@@ -191,6 +193,40 @@ def test_schema_sql_without_config_include(tmp_path):
     assert "CREATE DATABASE" in result
 
 
+def _capture_psql_script(run) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        script = Path(cmd[cmd.index("-f") + 1])
+        captured["cmd"] = cmd
+        captured["sql"] = script.read_text(encoding="utf-8")
+        captured["script"] = script
+        return type("Result", (), {"returncode": 0})()
+
+    run.side_effect = fake_run
+    return captured
+
+
+def test_psql_set_line_escapes_password():
+    assert _psql_set_line("winccoaPassword", "a'b\\c") == "\\set winccoaPassword 'a\\'b\\\\c'"
+
+
+def test_load_winccoa_config_rejects_host_flag(schema_dir_319, monkeypatch):
+    _set_required_winccoa_env(monkeypatch, schema_dir=schema_dir_319, version="3.19")
+    monkeypatch.setenv("WINCCOA_DB_HOST", "-c")
+
+    with pytest.raises(SystemExit, match="WINCCOA_DB_HOST"):
+        load_winccoa_config()
+
+
+def test_load_winccoa_config_rejects_bad_port(schema_dir_319, monkeypatch):
+    _set_required_winccoa_env(monkeypatch, schema_dir=schema_dir_319, version="3.19")
+    monkeypatch.setenv("WINCCOA_DB_PORT", "5432;drop")
+
+    with pytest.raises(SystemExit, match="WINCCOA_DB_PORT"):
+        load_winccoa_config()
+
+
 def test_cmd_create_winccoa_applies_nga_schema_319(cfg, monkeypatch, schema_dir_319):
     (cfg.data_dir / "PG_VERSION").write_text("18\n", encoding="utf-8")
     _set_required_winccoa_env(monkeypatch, schema_dir=schema_dir_319, version="3.19")
@@ -203,19 +239,24 @@ def test_cmd_create_winccoa_applies_nga_schema_319(cfg, monkeypatch, schema_dir_
         with patch("postgresql_portable.winccoa._ensure_tablespace_dirs"):
             with patch("postgresql_portable.winccoa._terminate_db_connections"):
                 with patch("postgresql_portable.winccoa.subprocess.run") as run:
-                    run.return_value.returncode = 0
+                    captured = _capture_psql_script(run)
                     with patch(
                         "postgresql_portable.winccoa._psql_scalar",
                         return_value="2.0",
                     ):
                         cmd_create_winccoa(cfg)
 
-    assert run.call_count == 1
-    cmd = run.call_args[0][0]
-    assert str(schema_dir_319 / "schema.sql") in cmd
-    assert "dbTableSpaceName=custom_db" in cmd
-    assert "useBtreeIndexesForSegments=FALSE" in cmd
-    assert "winccoaUsername=winccoa" in cmd
+    cmd = captured["cmd"]
+    sql = captured["sql"]
+    assert " ".join(cmd).count("-f") == 1
+    assert "secret" not in " ".join(cmd)
+    assert "winccoaPassword" not in " ".join(cmd)
+    assert "\\set winccoaPassword 'secret'" in sql
+    assert "\\set dbTableSpaceName 'custom_db'" in sql
+    assert "\\set useBtreeIndexesForSegments 'FALSE'" in sql
+    assert "\\set winccoaUsername 'winccoa'" in sql
+    assert (schema_dir_319 / "schema.sql").resolve().as_posix() in sql
+    assert not Path(captured["script"]).exists()
 
 
 def test_cmd_create_winccoa_applies_nga_schema_320(cfg, monkeypatch, tmp_path):
@@ -231,7 +272,7 @@ def test_cmd_create_winccoa_applies_nga_schema_320(cfg, monkeypatch, tmp_path):
             with patch("postgresql_portable.winccoa._terminate_db_connections"):
                 with patch("postgresql_portable.winccoa._drop_database") as drop_db:
                     with patch("postgresql_portable.winccoa.subprocess.run") as run:
-                        run.return_value.returncode = 0
+                        captured = _capture_psql_script(run)
                         with patch(
                             "postgresql_portable.winccoa._psql_scalar",
                             return_value="2.0",
@@ -239,10 +280,12 @@ def test_cmd_create_winccoa_applies_nga_schema_320(cfg, monkeypatch, tmp_path):
                             cmd_create_winccoa(cfg)
 
     drop_db.assert_not_called()
-    cmd = run.call_args[0][0]
-    assert "_postgresql_portable_schema.sql" in " ".join(cmd)
-    assert "UseBtreeIndexForSimpleValueTypes=FALSE" in cmd
-    assert "dbTableSpaceName" not in " ".join(cmd)
+    sql = captured["sql"]
+    assert "secret" not in " ".join(captured["cmd"])
+    assert "_postgresql_portable_schema.sql" in sql
+    assert "\\set UseBtreeIndexForSimpleValueTypes 'FALSE'" in sql
+    assert "dbTableSpaceName" not in sql
+    assert not Path(captured["script"]).exists()
 
 
 def test_cmd_create_winccoa_drops_existing_db_on_recreate_320(cfg, monkeypatch, tmp_path):
@@ -258,7 +301,7 @@ def test_cmd_create_winccoa_drops_existing_db_on_recreate_320(cfg, monkeypatch, 
             with patch("postgresql_portable.winccoa._drop_database") as drop_db:
                 with patch("postgresql_portable.winccoa._object_exists", return_value=True):
                     with patch("postgresql_portable.winccoa.subprocess.run") as run:
-                        run.return_value.returncode = 0
+                        run.side_effect = lambda *args, **kwargs: type("Result", (), {"returncode": 0})()
                         with patch(
                             "postgresql_portable.winccoa._psql_scalar",
                             return_value="2.0",
@@ -353,3 +396,30 @@ def test_validate_schema_fingerprint_320_vs_321(tmp_path):
 
     with pytest.raises(SystemExit, match="dbVersion 3.0"):
         _validate_schema_fingerprint("3.20", dir_321)
+
+
+def test_remove_tablespace_dirs_refuses_path_outside_root(monkeypatch, tmp_path):
+    root = tmp_path / "data_winccoa_tablespaces"
+    root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("keep", encoding="utf-8")
+    monkeypatch.setenv("WINCCOA_TABLESPACE_ROOT", str(root))
+    monkeypatch.setenv("WINCCOA_TABLESPACE_DB", str(outside))
+
+    with pytest.raises(SystemExit, match="outside"):
+        _remove_tablespace_dirs()
+
+    assert (outside / "secret.txt").is_file()
+
+
+def test_remove_tablespace_dirs_removes_directory_under_root(monkeypatch, tmp_path):
+    root = tmp_path / "data_winccoa_tablespaces"
+    db = root / "db"
+    db.mkdir(parents=True)
+    (db / "marker.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("WINCCOA_TABLESPACE_ROOT", str(root))
+
+    _remove_tablespace_dirs()
+
+    assert not db.exists()

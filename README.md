@@ -10,12 +10,14 @@ This repo holds the database cluster and helper scripts. PostgreSQL binaries are
 
 2. Extract the ZIP to any folder you like. Use the inner `pgsql` directory (do not flatten the archive). Copy that path for `PG_INSTALL`, for example:
 
-   `D:\Tools\postgresql-17.6-1-windows-x64-binaries\pgsql`
+   `D:\Tools\postgresql-17.11-1-windows-x64-binaries\pgsql`
+
+   Use the latest minor of a supported major version. The August 13, 2026 security update is 18.6, 17.11, 16.15, 15.19, and 14.24. PostgreSQL 14 stops receiving fixes on November 12, 2026.
 
 3. Copy `.env.example` to `.env` and set `PG_INSTALL` to that path:
 
    ```ini
-   PG_INSTALL=D:\Tools\postgresql-17.6-1-windows-x64-binaries\pgsql
+   PG_INSTALL=D:\Tools\postgresql-17.11-1-windows-x64-binaries\pgsql
    PG_DATA=data
    ```
 
